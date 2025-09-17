@@ -1,6 +1,4 @@
-# common.py + 4bit
-
-# This file contains modules common to various models
+# common.py + 4QAT
 
 import math
 
@@ -16,6 +14,9 @@ from utils.plots import color_list
 import warnings
 
 import torch.nn.functional as F
+
+from .quant_common import CommonIntActQuant, CommonUintActQuant, CommonWeightQuant, CommonActQuant
+from .quant_common import CommonIntWeightPerChannelQuant, CommonIntWeightPerTensorQuant
 
 def autopad(k, p=None):  # kernel, padding
     # Pad to 'same'
