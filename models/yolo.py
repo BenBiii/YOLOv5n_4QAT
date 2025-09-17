@@ -118,7 +118,7 @@ class Detect(nn.Module):
         else:
             return torch.cat(z, 1), x
             ################
-
+        """
         for i in range(self.nl):
             x[i] = self.m[i](x[i])  # conv
             bs, _, ny, nx = x[i].shape  # x(bs,255,20,20) to x(bs,3,20,20,85)
@@ -168,6 +168,7 @@ class Detect(nn.Module):
         grid = torch.stack((xv, yv), 2).expand((1, self.na, ny, nx, 2)).float()
         anchor_grid = (self.anchors[i].clone() * self.stride[i]).view((1, self.na, 1, 1, 2)).expand((1, self.na, ny, nx, 2)).float()
         return grid, anchor_grid
+        """
     
 class Model(nn.Module):
     def __init__(self, cfg='yolov5n.yaml', ch=3, nc=None):  # model, input channels, number of classes
