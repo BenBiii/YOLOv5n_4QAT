@@ -15,6 +15,15 @@ import warnings
 
 import torch.nn.functional as F
 
+#=== Quant ===
+# Quant layers
+from brevitas.nn import QuantConv2d, QuantLinear, QuantReLU, QuantSigmoid, QuantHardTanh, QuantIdentity
+try:
+    from brevitas.nn import QuantAvgPool2d
+except Exception as e:
+    from brevitas.nn import TruncAvgPool2d as QuantAvgPool2d
+from brevitas.quant import IntBias, Int8ActPerTensorFloatMinMaxInit
+
 from .quant_common import CommonIntActQuant, CommonUintActQuant, CommonWeightQuant, CommonActQuant
 from .quant_common import CommonIntWeightPerChannelQuant, CommonIntWeightPerTensorQuant
 
@@ -45,20 +54,63 @@ class Conv(nn.Module):
     def __init__(self, c1, c2, k=1, s=1, p=None, g=1, act=True):  # ch_in, ch_out, kernel, stride, padding, groups
         super(Conv, self).__init__()
         self.conv = nn.Conv2d(c1, c2, k, s, autopad(k, p), groups=g, bias=False)
-        #------------------------------------------------------
         self.bn = nn.BatchNorm2d(c2)
-        #self.bn = nn.BatchNorm2d(c2, eps=0.001, momentum=0.03)
-        #------------------------------------------------------
-        #self.act = nn.SiLU() if act is True else (act if isinstance(act, nn.Module) else nn.Identity())
-        #self.act = nn.LeakyReLU(0.1, inplace=True) if act is True else (act if isinstance(act, nn.Module) else nn.Identity())
         self.act = nn.LeakyReLU(0.125, inplace=True) if act is True else (act if isinstance(act, nn.Module) else nn.Identity())
-        #self.act = self.act = nn.LeakyReLU(0.1, inplace=True) if act is True else (act if isinstance(act, nn.Module) else nn.Identity())
 
     def forward(self, x):
         return self.act(self.bn(self.conv(x)))
 
     def fuseforward(self, x):
         return self.act(self.conv(x))
+
+#=== Quant ===        
+class QuantConv(nn.Module):
+    # Standard convolution
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, use_act=True,
+                 use_bn=True, weight_bit_width=4, act_bit_width=2):  # ch_in, ch_out, kernel, stride, padding, groups
+        super().__init__()
+        self.use_act = use_act
+        self.use_bn = use_bn
+
+        if weight_bit_width == 1:
+            weight_quant = CommonWeightQuant
+        else:
+            weight_quant = CommonIntWeightPerChannelQuant
+        if act_bit_width == 1: 
+            act_quant = CommonActQuant
+        else:
+            act_quant = CommonUintActQuant
+        self.conv = QuantConv2d(
+            in_channels=c1,
+            out_channels=c2,
+            kernel_size=k,
+            stride=s,
+            padding=autopad(k, p),
+            groups=g,
+            bias=False,
+            weight_quant=weight_quant,
+            weight_bit_width=weight_bit_width)
+        self.bn = nn.BatchNorm2d(c2)
+        self.act = QuantReLU(
+            act_quant=act_quant,
+            bit_width=act_bit_width,
+            per_channel_broadcastable_shape=(1, c2, 1, 1),
+            scaling_per_channel=False,
+            return_quant_tensor=True)
+
+    def forward(self, x):
+        x = self.conv(x)
+        if self.use_bn:
+            x = self.bn(x)
+        if self.use_act:
+            x = self.act(x)
+        return x
+
+    def forward_fuse(self, x):
+        x = self.conv(x)
+        if self.use_act:
+            x = self.act(x)
+        return x
 
 class StemBlock(nn.Module):
     def __init__(self, c1, c2, k=3, s=2, p=None, g=1, act=True):
@@ -68,6 +120,24 @@ class StemBlock(nn.Module):
         self.stem_2b = Conv(c2 // 2, c2, 3, 2, 1)
         self.stem_2p = nn.MaxPool2d(kernel_size=2,stride=2,ceil_mode=True)
         self.stem_3 = Conv(c2 * 2, c2, 1, 1, 0)
+
+    def forward(self, x):
+        stem_1_out  = self.stem_1(x)
+        stem_2a_out = self.stem_2a(stem_1_out)
+        stem_2b_out = self.stem_2b(stem_2a_out)
+        stem_2p_out = self.stem_2p(stem_1_out)
+        out = self.stem_3(torch.cat((stem_2b_out,stem_2p_out),1))
+        return out
+
+#=== Quant ===        
+class QuantStemBlock(nn.Module):
+    def __init__(self, c1, c2, k=3, s=2, p=None, g=1, act=True):
+        super(StemBlock, self).__init__()
+        self.stem_1 = QuantConv(c1, c2, k, s, p, g, act)
+        self.stem_2a = QuantConv(c2, c2 // 2, 1, 1, 0)
+        self.stem_2b = QuantConv(c2 // 2, c2, 3, 2, 1)
+        self.stem_2p = nn.MaxPool2d(kernel_size=2,stride=2,ceil_mode=True)
+        self.stem_3 = QuantConv(c2 * 2, c2, 1, 1, 0)
 
     def forward(self, x):
         stem_1_out  = self.stem_1(x)
@@ -88,6 +158,21 @@ class Bottleneck(nn.Module):
 
     def forward(self, x):
         return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
+
+#=== Quant ===    
+class QuantBottleneck(nn.Module):
+    # Standard quantized bottleneck
+    def __init__(self, c1, c2, shortcut=True, g=1, e=0.5,
+                 weight_bit_width=4, act_bit_width=2):  # ch_in, ch_out, shortcut, groups, expansion, weight bit, act bit
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = QuantConv(c1, c_, 1, 1, weight_bit_width=weight_bit_width, act_bit_width=act_bit_width)
+        self.cv2 = QuantConv(c_, c2, 3, 1, g=g, weight_bit_width=weight_bit_width, act_bit_width=act_bit_width)
+        self.add = shortcut and c1 == c2
+        self.quant_identity = QuantIdentity(bit_width=weight_bit_width)
+
+    def forward(self, x):
+        return self.quant_identity(x) + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
 
 class BottleneckCSP(nn.Module):
     # CSP Bottleneck https://github.com/WongKinYiu/CrossStagePartialNetworks
@@ -121,6 +206,33 @@ class C3(nn.Module):
 
     def forward(self, x):
         return self.cv3(torch.cat((self.m(self.cv1(x)), self.cv2(x)), dim=1))
+    
+#=== Quant ===
+class QuantC3(nn.Module):
+    # Quantized CSP Bottleneck with 3 convolutions
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5,
+                 weight_bit_width=4, act_bit_width=2, use_hardtanh=False):  # ch_in, ch_out, number, shortcut, groups, expansion, weight bit, act bit
+        super().__init__()
+        self.use_hardtanh = use_hardtanh
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = QuantConv(c1, c_, 1, 1, weight_bit_width=weight_bit_width, act_bit_width=act_bit_width)
+        self.cv2 = QuantConv(c1, c_, 1, 1, weight_bit_width=weight_bit_width, act_bit_width=act_bit_width)
+        self.cv3 = QuantConv(2 * c_, c2, 1, weight_bit_width=weight_bit_width, act_bit_width=act_bit_width)  # act=FReLU(c2)
+        self.m = nn.Sequential(*[QuantBottleneck(c_, c_, shortcut, g, e=1.0,
+                                                 weight_bit_width=weight_bit_width, act_bit_width=act_bit_width)
+                                 for _ in range(n)])
+        # self.m = nn.Sequential(*[CrossConv(c_, c_, 3, 1, g, 1.0, shortcut) for _ in range(n)])
+        if self.use_hardtanh:
+            self.hard_quant = QuantHardTanh(
+                max_val=1.0, min_val=-1.0,
+                act_quant=CommonActQuant,
+                bit_width=8)
+
+    def forward(self, x):
+        out = self.cv3(torch.cat((self.m(self.cv1(x)), self.cv2(x)), dim=1))
+        if self.use_hardtanh:
+            out = self.hard_quant(out / 2)
+        return out
 
 class ShuffleV2Block(nn.Module):
     """
@@ -194,6 +306,53 @@ class ShuffleV2Block(nn.Module):
     @staticmethod
     def depthwise_conv(i, o, kernel_size, stride=1, padding=0, bias=False):
         return nn.Conv2d(i, o, kernel_size, stride, padding, bias=bias, groups=i)
+
+    def forward(self, x):
+        if self.stride == 1:
+            x1, x2 = x.chunk(2, dim=1)
+            out = torch.cat((x1, self.branch2(x2)), dim=1)
+        else:
+            out = torch.cat((self.branch1(x), self.branch2(x)), dim=1)
+        out = channel_shuffle(out, 2)
+        return out
+
+#=== Quant === 
+class QuantShuffleV2Block(nn.Module):
+    def __init__(self, inp, oup, stride):
+        super(ShuffleV2Block, self).__init__()
+
+        if not (1 <= stride <= 3):
+            raise ValueError('illegal stride value')
+        self.stride = stride
+
+        branch_features = oup // 2
+        assert (self.stride != 1) or (inp == branch_features << 1)
+
+        if self.stride > 1:
+            self.branch1 = nn.Sequential(
+                self.Quant_depthwise_conv(inp, inp, kernel_size=3, stride=self.stride, padding=1),
+                nn.BatchNorm2d(inp, eps=0.001, momentum=0.03),
+                QuantConv2d(inp, branch_features, kernel_size=1, stride=1, padding=0, bias=False),
+                nn.BatchNorm2d(branch_features, eps=0.001, momentum=0.03),
+                nn.LeakyReLU(0.125, inplace=True),
+            )
+        else:
+            self.branch1 = nn.Sequential()
+
+        self.branch2 = nn.Sequential(
+            QuantConv2d(inp if (self.stride > 1) else branch_features, branch_features, kernel_size=1, stride=1, padding=0, bias=False),
+            nn.BatchNorm2d(branch_features, eps=0.001, momentum=0.03),
+            nn.LeakyReLU(0.125, inplace=True),
+            self.Quant_depthwise_conv(branch_features, branch_features, kernel_size=3, stride=self.stride, padding=1),
+            nn.BatchNorm2d(branch_features, eps=0.001, momentum=0.03),
+            QuantConv2d(branch_features, branch_features, kernel_size=1, stride=1, padding=0, bias=False),
+            nn.BatchNorm2d(branch_features, eps=0.001, momentum=0.03),
+            nn.LeakyReLU(0.125, inplace=True),
+        )
+
+    @staticmethod
+    def Quant_depthwise_conv(i, o, kernel_size, stride=1, padding=0, bias=False):
+        return nn.QuantConv2d(i, o, kernel_size, stride, padding, bias=bias, groups=i)
 
     def forward(self, x):
         if self.stride == 1:
@@ -502,319 +661,4 @@ class Classify(nn.Module):
     def forward(self, x):
         z = torch.cat([self.aap(y) for y in (x if isinstance(x, list) else [x])], 1)  # cat if list
         return self.flat(self.conv(z))  # flatten to x(b,c2)
-
-
-# ========= 4bit quantization ==========
-class SCQActivation(nn.Module):
-    """
-    Signed Clipping Quantization for Activation
-    """
-    def __init__(self, bit=4):
-        super(SCQActivation, self).__init__()
-        self.bit = bit
-        self.qmin = -(2 ** (bit - 1))
-        self.qmax = (2 ** (bit - 1)) - 1
-
-    def forward(self, x):
-        scale = x.abs().max() / self.qmax + 1e-8  # avoid zero-div
-        x_q = torch.clamp(torch.round(x / scale), self.qmin, self.qmax)
-        return x_q * scale
-    
-class M4bQInputConv(nn.Module):
-    """
-    M4bQInputConv: RGB input 8bit --> 4bit odd / even 분해 --> conv 합산.
-    """
-
-    def __init__(self, conv: nn.Conv2d, bit=4):
-        super(M4bQInputConv, self).__init__()
-        self.bit = bit
-        self.qmax = (1 << (bit - 1)) - 1  # 7
-        self.qmin = -(1 << (bit - 1))     # -8
-
-        # 4bit용으로 동일한 weight, bias를 복사한 두 개의 conv 정의
-        self.conv_odd = nn.Conv2d(conv.in_channels, conv.out_channels,
-                                  kernel_size=conv.kernel_size,
-                                  stride=conv.stride,
-                                  padding=conv.padding,
-                                  dilation=conv.dilation,
-                                  groups=conv.groups,
-                                  bias=(conv.bias is not None))
-
-        self.conv_even = nn.Conv2d(conv.in_channels, conv.out_channels,
-                                   kernel_size=conv.kernel_size,
-                                   stride=conv.stride,
-                                   padding=conv.padding,
-                                   dilation=conv.dilation,
-                                   groups=conv.groups,
-                                   bias=(conv.bias is not None))
-
-        # weight, bias 복사
-        self.conv_odd.weight.data.copy_(conv.weight.data)
-        self.conv_even.weight.data.copy_(conv.weight.data)
-        if conv.bias is not None:
-            self.conv_odd.bias.data.copy_(conv.bias.data)
-            self.conv_even.bias.data.copy_(conv.bias.data)
-
-    @staticmethod
-    def from_conv(conv: nn.Conv2d):
-        return M4bQInputConv(conv)
-
-    def quantize_input_8bit(self, x):
-        # SCQ 8bit activation quantization --> 양자화 후 fp32로 유지
-        x_q = torch.clamp(x, min=-128, max=127)  # int8 범위
-        return x_q
-
-    def decompose_4bit(self, x_q8):
-        # 논문 (5), (6): 8bit 값을 odd/even 4bit로 분해
-        f_odd = torch.floor(x_q8 / 16)
-        #f_even = (x_q8 % 16) - 8
-        f_even = torch.remainder(x_q8, 16) - 8
-
-        f_odd = torch.clamp(f_odd, self.qmin, self.qmax)
-        f_even = torch.clamp(f_even, self.qmin, self.qmax)
-        return f_odd, f_even
-
-    def forward(self, x):
-        # Step 1: 8bit quantization (SCQ simulation)
-        x_q8 = self.quantize_input_8bit(x)
-
-        # Step 2: decompose to two 4bit tensors
-        x_odd, x_even = self.decompose_4bit(x_q8)
-
-        # Step 3: apply conv separately
-        #out_odd = self.conv_odd(x_odd.float()) * 16
-        #out_even = self.conv_even(x_even.float() + 8)
-        out_odd = self.conv_odd(x_odd * 1.0) * 16.0
-        out_even = self.conv_even(x_even + 8.0)
-
-        return out_odd + out_even
-    
-class QuantConv2d(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, stride, padding,
-                 bias=True, w_bits=4, groups=1):
-        super().__init__()
-        
-        if isinstance(kernel_size, int):
-            kernel_size = (kernel_size, kernel_size)
-        if isinstance(stride, int):
-            stride = (stride, stride)
-        if isinstance(padding, int):
-            padding = (padding, padding)
-
-        self.w_bits = w_bits
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size,
-                              stride, padding, bias=bias, groups=groups)
-
-        # step size는 학습 가능한 변수로 정의
-        self.alpha = nn.Parameter(torch.tensor(1.0))  # scale factor for quantization
-
-    def quantize_weight(self, w):
-        # LSQ - 4bit quantization
-        qn = -2 ** (self.w_bits - 1)
-        qp = 2 ** (self.w_bits - 1) - 1
-
-        g = 1.0 / ((w.numel() * qp) ** 0.5)  # gradient scale
-        alpha = self.alpha.clamp(min=1e-5)
-
-        w_q = (w / alpha).clamp(qn, qp).round() * alpha
-        return w_q
-
-    def forward(self, x):
-        w_q = self.quantize_weight(self.conv.weight)
-        w_q = w_q.to(dtype=x.dtype, device=x.device)
-
-        b = self.conv.bias
-        if b is not None:
-            b = b.to(dtype=x.dtype, device=x.device)
-
-        return F.conv2d(x, w_q, b, self.conv.stride,
-                        self.conv.padding, self.conv.dilation, self.conv.groups)
-
-
-    @classmethod
-    def from_conv(cls, conv: nn.Conv2d):
-        quant = cls(
-            in_channels=conv.in_channels,
-            out_channels=conv.out_channels,
-            kernel_size=conv.kernel_size,
-            stride=conv.stride,
-            padding=conv.padding,
-            bias=(conv.bias is not None),
-            w_bits=4,
-            groups=conv.groups
-        )
-        #quant.conv.groups = conv.groups  # group conv 호환
-
-        # weight 복사
-        with torch.no_grad():
-            quant.conv.weight.copy_(conv.weight)
-            if conv.bias is not None:
-                quant.conv.bias.copy_(conv.bias)
-        return quant
-    
-        # === Conv2d 속성 proxy 추가 ===
-    @property
-    def in_channels(self): return self.conv.in_channels
-    @property
-    def out_channels(self): return self.conv.out_channels
-    @property
-    def kernel_size(self): return self.conv.kernel_size
-    @property
-    def stride(self): return self.conv.stride
-    @property
-    def padding(self): return self.conv.padding
-    @property
-    def dilation(self): return self.conv.dilation
-    @property
-    def groups(self): return self.conv.groups
-    @property
-    def bias(self): return self.conv.bias
-    @property
-    def weight(self): return self.conv.weight
-
-class QuantConv2d_LSQ(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, stride, padding,
-                 bias=True, w_bits=4, groups=1):
-        super().__init__()
-        
-        if isinstance(kernel_size, int):
-            kernel_size = (kernel_size, kernel_size)
-        if isinstance(stride, int):
-            stride = (stride, stride)
-        if isinstance(padding, int):
-            padding = (padding, padding)
-
-        self.w_bits = w_bits
-        self.qn = -2 ** (w_bits - 1)
-        self.qp = 2 ** (w_bits - 1) - 1
-
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size,
-                              stride, padding, bias=bias, groups=groups)
-
-        self.alpha = nn.Parameter(torch.tensor(1.0))  # step size (learnable)
-        self.init_done = False
-
-            # === Conv2d 속성 proxy ===
-    @property
-    def weight(self): return self.conv.weight
-
-    @property
-    def bias(self): return self.conv.bias
-
-    @property
-    def in_channels(self): return self.conv.in_channels
-
-    @property
-    def out_channels(self): return self.conv.out_channels
-
-    @property
-    def kernel_size(self): return self.conv.kernel_size
-
-    @property
-    def stride(self): return self.conv.stride
-
-    @property
-    def padding(self): return self.conv.padding
-
-    @property
-    def dilation(self): return self.conv.dilation
-
-    @property
-    def groups(self): return self.conv.groups
-
-
-
-    def forward(self, x):
-        w = self.conv.weight.to(dtype=x.dtype, device=x.device)
-        #w = self.conv.weight
-
-        if not self.init_done:
-            # alpha 초기값 설정: 평균적인 weight magnitude에 맞춤
-            #self.alpha.data.copy_(2 * w.abs().mean() / (self.qp ** 0.5))
-            # int8
-            self.alpha.data.copy_(2 * w.abs().float().mean() / (self.qp ** 0.5))
-            self.init_done = True
-
-        # 실제 weight 양자화 (custom function with backward)
-        w_q = LSQQuantizer.apply(w, self.alpha, self.qn, self.qp)
-
-        b = self.conv.bias
-        return F.conv2d(x, w_q, b, self.conv.stride,
-                        self.conv.padding, self.conv.dilation, self.conv.groups)
-    
-    def __getattribute__(self, name):
-        # 먼저 기본 속성을 가져오려 시도
-        try:
-            return super().__getattribute__(name)
-        except AttributeError:
-            # 기본 속성에 없으면 self.conv에서 가져오기 시도
-            conv = super().__getattribute__('__dict__').get('conv', None)
-            if conv is not None and hasattr(conv, name):
-                return getattr(conv, name)
-            raise
-
-    @classmethod
-    def from_conv(cls, conv: nn.Conv2d):
-        q = cls(conv.in_channels, conv.out_channels,
-                conv.kernel_size, conv.stride, conv.padding,
-                bias=(conv.bias is not None), w_bits=4, groups=conv.groups)
-        q.conv.weight.data.copy_(conv.weight.data)
-        if conv.bias is not None:
-            q.conv.bias.data.copy_(conv.bias.data)
-        return q
-
-
-class LSQQuantizer(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, w, alpha, qn, qp):
-        ctx.save_for_backward(w, alpha)
-        ctx.other = (qn, qp)
-
-        # 정방향: 양자화 수행
-        w_div = w / alpha
-        w_clamped = torch.clamp(w_div, qn, qp)
-        w_rounded = w_clamped.round()
-        w_quant = w_rounded * alpha
-
-        return w_quant
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        w, alpha = ctx.saved_tensors
-        qn, qp = ctx.other
-
-        # g = LSQ scaling factor
-        g = 1.0 / ((w.numel() * qp) ** 0.5)
-
-        # ∂L/∂w ≈ ∂L/∂w_quant
-        grad_w = grad_output.clone()
-
-        # ∂L/∂alpha: LSQ 방식
-        w_div = w / alpha
-        indicator = ((w_div >= qn) & (w_div <= qp)).float()
-        grad_alpha = ((w_div - w_div.round()) * indicator * grad_output).sum().unsqueeze(0)
-        grad_alpha = grad_alpha * g
-
-        return grad_w, grad_alpha, None, None  # 나머지는 정수 qn/qp, gradient 없음
-    
-    #Stemblock --> M4bQ
-class M4bQ(nn.Module):
-    def __init__(self, c1, c2, k=3, s=2, p=None, g=1, act=True):
-        super(M4bQ, self).__init__()
-        base_conv = Conv(c1, c2, k, s, p, g, act)
-        self.stem_1 = M4bQInputConv.from_conv(base_conv.conv)
-        self.stem_2a = Conv(c2, c2 // 2, 1, 1, 0)
-        self.stem_2b = Conv(c2 // 2, c2, 3, 2, 1)
-        self.stem_2p = nn.MaxPool2d(kernel_size=2,stride=2,ceil_mode=True)
-        self.stem_3 = Conv(c2 * 2, c2, 1, 1, 0)
-
-    def forward(self, x):
-        stem_1_out  = self.stem_1(x)
-        stem_2a_out = self.stem_2a(stem_1_out)
-        stem_2b_out = self.stem_2b(stem_2a_out)
-        stem_2p_out = self.stem_2p(stem_1_out)
-        out = self.stem_3(torch.cat((stem_2b_out,stem_2p_out),1))
-        return out
-    
-# ===================
 

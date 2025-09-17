@@ -433,9 +433,7 @@ if __name__ == '__main__':
     #------------------------------------------
     #parser.add_argument('--weights', type=str, default='weights/yolov5n-face.pt', help='initial weights path')
     parser.add_argument('--weights', type=str, default='', help='initial weights path')
-    parser.add_argument('--cfg', type=str, default='models/yolov5n.yaml', help='model.yaml path')
-    #parser.add_argument('--weights', type=str, default='weights/yolov5s.pt', help='initial weights path')
-    #parser.add_argument('--cfg', type=str, default='models/yolov5s.yaml', help='model.yaml path')
+    parser.add_argument('--cfg', type=str, default='models/yolov5n_QAT.yaml', help='model.yaml path')
     parser.add_argument('--data', type=str, default='data/widerface.yaml', help='data.yaml path')
     parser.add_argument('--hyp', type=str, default='data/hyp.scratch.yaml', help='hyperparameters path')
     parser.add_argument('--epochs', type=int, default=250)

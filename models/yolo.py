@@ -1,3 +1,5 @@
+# yolo.py + QAT
+
 import argparse
 import logging
 import math
@@ -11,7 +13,8 @@ import torch.nn as nn
 sys.path.append('./')  # to run '$ python *.py' files in subdirectories
 logger = logging.getLogger(__name__)
 
-from models.common import Conv, Bottleneck, SPP, DWConv, Focus, BottleneckCSP, C3, ShuffleV2Block, Concat, NMS, autoShape, StemBlock, BlazeBlock, DoubleBlazeBlock
+from models.common import *
+from models.quant_common import CommonIntWeightPerChannelQuant
 from models.experimental import MixConv2d, CrossConv
 from utils.autoanchor import check_anchor_order
 from utils.general import make_divisible, check_file, set_logging
@@ -30,52 +33,92 @@ class Detect(nn.Module):
     stride = None  # strides computed during build
     export_cat = False  # onnx export cat output
 
-    def __init__(self, nc=80, anchors=(), ch=()):  # detection layer
+    def __init__(self, nc=80, anchors=(), ch=(), in_conv=True, use_hardtanh=False, inplace=True, weight_bit_width=None):  # detection layer
         super(Detect, self).__init__()
         self.nc = nc  # number of classes
-        #self.no = nc + 5  # number of outputs per anchor
         self.no = nc + 5 + 10  # number of outputs per anchor
-
         self.nl = len(anchors)  # number of detection layers
         self.na = len(anchors[0]) // 2  # number of anchors
-        self.grid = [torch.zeros(1)] * self.nl  # init grid
+        #self.grid = [torch.zeros(1)] * self.nl  # init grid
+        self.grid = [torch.zeros(0)] * self.nl
         a = torch.tensor(anchors).float().view(self.nl, -1, 2)
         self.register_buffer('anchors', a)  # shape(nl,na,2)
         self.register_buffer('anchor_grid', a.clone().view(self.nl, 1, -1, 1, 1, 2))  # shape(nl,1,na,1,1,2)
-        self.m = nn.ModuleList(nn.Conv2d(x, self.no * self.na, 1) for x in ch)  # output conv
+        self.in_conv = in_conv
+        self.use_hardtanh = use_hardtanh
+        self.inplace = inplace
+        self.onnx_dynamic = False
+
+        if weight_bit_width is not None:
+            self.m = nn.ModuleList(QuantConv2d(
+                in_channels = x,
+                out_channels = self.no * self.na,
+                kernel_size = 1,
+                stride = 1,
+                bias = False,
+                weight_quant=CommonIntWeightPerChannelQuant,
+                weight_bit_width=weight_bit_width
+                ) for x in ch)
+        else:
+            self.m = nn.ModuleList(nn.Conv2d(x, self.no * self.na, 1) for x in ch)
+        #self.m = nn.ModuleList(nn.Conv2d(x, self.no * self.na, 1) for x in ch)  # output conv
+
+
+    # === 여기 부분 추가 확인 ===
+    def _make_grid_new(self, nx, ny, i):
+        # grid: (1, 1, ny, nx, 2)
+        yv, xv = torch.meshgrid(torch.arange(ny, device=self.anchor_grid.device),
+                                torch.arange(nx, device=self.anchor_grid.device),
+                                indexing='ij')
+        grid = torch.stack((xv, yv), 2).view(1, 1, ny, nx, 2).float()
+        # anchor_grid_i: (1, na, 1, 1, 2)  (버퍼에서 읽기만 함)
+        ag_i = self.anchor_grid[i]
+        return grid, ag_i
+    
+        self.inplace = inplace
 
     def forward(self, x):
         # x = x.copy()  # for profiling
         z = []  # inference output
-        if self.export_cat:
-            for i in range(self.nl):
-                x[i] = self.m[i](x[i])  # conv
-                bs, _, ny, nx = x[i].shape  # x(bs,255,20,20) to x(bs,3,20,20,85)
-                x[i] = x[i].view(bs, self.na, self.no, ny, nx).permute(0, 1, 3, 4, 2).contiguous()
+        for i in range(self.nl):
+            if self.in_conv:
+                x[i] = self.m[i](x[i])
+            bs, _, ny, nx = x[i].shape
+            x[i] = x[i].view(bs, self.na, self.no, ny, nx).permute(0, 1, 3, 4, 2).contiguous()
 
-                if self.grid[i].shape[2:4] != x[i].shape[2:4]:
-                    # self.grid[i] = self._make_grid(nx, ny).to(x[i].device)
-                    self.grid[i], self.anchor_grid[i] = self._make_grid_new(nx, ny,i)
-
-                y = torch.full_like(x[i], 0)
-                y = y + torch.cat((x[i][:, :, :, :, 0:5].sigmoid(), torch.cat((x[i][:, :, :, :, 5:15], x[i][:, :, :, :, 15:15+self.nc].sigmoid()), 4)), 4)
-
-                box_xy = (y[:, :, :, :, 0:2] * 2. - 0.5 + self.grid[i].to(x[i].device)) * self.stride[i] # xy
-                box_wh = (y[:, :, :, :, 2:4] * 2) ** 2 * self.anchor_grid[i] # wh
-                # box_conf = torch.cat((box_xy, torch.cat((box_wh, y[:, :, :, :, 4:5]), 4)), 4)
-
-                landm1 = y[:, :, :, :, 5:7] * self.anchor_grid[i] + self.grid[i].to(x[i].device) * self.stride[i]  # landmark x1 y1
-                landm2 = y[:, :, :, :, 7:9] * self.anchor_grid[i] + self.grid[i].to(x[i].device) * self.stride[i]  # landmark x2 y2
-                landm3 = y[:, :, :, :, 9:11] * self.anchor_grid[i] + self.grid[i].to(x[i].device) * self.stride[i]  # landmark x3 y3
-                landm4 = y[:, :, :, :, 11:13] * self.anchor_grid[i] + self.grid[i].to(x[i].device) * self.stride[i]  # landmark x4 y4
-                landm5 = y[:, :, :, :, 13:15] * self.anchor_grid[i] + self.grid[i].to(x[i].device) * self.stride[i]  # landmark x5 y5
-                # landm = torch.cat((landm1, torch.cat((landm2, torch.cat((landm3, torch.cat((landm4, landm5), 4)), 4)), 4)), 4)
-                # y = torch.cat((box_conf, torch.cat((landm, y[:, :, :, :, 15:15+self.nc]), 4)), 4)
-                y = torch.cat([box_xy, box_wh, y[:, :, :, :, 4:5], landm1, landm2, landm3, landm4, landm5, y[:, :, :, :, 15:15+self.nc]], -1)
-
+            if not self.training:
+                #if self.grid[i].shape[2:4] != x[i].shape[2:4] or self.onnx_dynamic:
+                if (self.grid[i].numel() == 0) or (self.grid[i].shape[2:4] != x[i].shape[2:4]) or getattr(self, "onnx_dynamic", False):
+                    #self.gird[i], self.anchor_grid[i] = self._make_grid_new(nx, ny, i)
+                    gi, _ = self._make_grid_new(nx, ny, i)
+                    self.grid[i] = gi.to(x[i].device)
+                y = x[i]
+                if self.use_hardtanh:
+                    y[..., 4:] = y[..., 4:] #/ 2 + 0.5
+                else:
+                    y = y.sigmoid()
+                if self.inplace:
+                    if not self.use_hardtanh:
+                        y[..., 0:2] = (y[..., 0:2] * 2. - 0.5 + self.grid[i]) * self.stride[i]  # xy
+                        y[..., 2:4] = (y[..., 2:4] * 2) ** 2 * self.anchor_grid[i]  # wh
+                    else:
+                        y[..., 0:2] = (y[..., 0:2] + 1.0 - 0.5 + self.grid[i]) * self.stride[i]  # xy
+                        y[..., 2:4] = (y[..., 2:4] + 1.0) ** 2 * self.anchor_grid[i]  # wh
+                else :
+                    if not self.use_hardtanh:
+                        xy = (y[..., 0:2] * 2. - 0.5 + self.grid[i]) * self.stride[i]  # xy
+                        wh = (y[..., 2:4] * 2) ** 2 * self.anchor_grid[i]  # wh
+                    else:
+                        xy = (y[..., 0:2] + 1.0 - 0.5 + self.grid[i]) * self.stride[i]  # xy
+                        wh = (y[..., 2:4] + 1.0) ** 2 * self.anchor_grid[i]  # wh
+                    y = torch.cat((xy, wh, y[..., 4:]), -1)
                 z.append(y.view(bs, -1, self.no))
-            return torch.cat(z, 1)
-        
+        if self.training :
+            return x
+        else:
+            return torch.cat(z, 1), x
+            ################
+
         for i in range(self.nl):
             x[i] = self.m[i](x[i])  # conv
             bs, _, ny, nx = x[i].shape  # x(bs,255,20,20) to x(bs,3,20,20,85)
@@ -125,6 +168,7 @@ class Detect(nn.Module):
         grid = torch.stack((xv, yv), 2).expand((1, self.na, ny, nx, 2)).float()
         anchor_grid = (self.anchors[i].clone() * self.stride[i]).view((1, self.na, 1, 1, 2)).expand((1, self.na, ny, nx, 2)).float()
         return grid, anchor_grid
+    
 class Model(nn.Module):
     def __init__(self, cfg='yolov5n.yaml', ch=3, nc=None):  # model, input channels, number of classes
         super(Model, self).__init__()
@@ -275,7 +319,7 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
                 pass
 
         n = max(round(n * gd), 1) if n > 1 else n  # depth gain
-        if m in [Conv, Bottleneck, SPP, DWConv, MixConv2d, Focus, CrossConv, BottleneckCSP, C3, ShuffleV2Block, StemBlock, BlazeBlock, DoubleBlazeBlock]:
+        if m in [Conv, Bottleneck, SPP, DWConv, MixConv2d, Focus, CrossConv, BottleneckCSP, C3, ShuffleV2Block, StemBlock, BlazeBlock, DoubleBlazeBlock, QuantConv, QuantC3, QuantBottleneck, QuantShuffleV2Block]:
             c1, c2 = ch[f], args[0]
 
             # Normal
@@ -297,7 +341,7 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
             #     c2 = make_divisible(c2, 8) if c2 != no else c2
 
             args = [c1, c2, *args[1:]]
-            if m in [BottleneckCSP, C3]:
+            if m in [BottleneckCSP, C3,  QuantC3, QuantBottleneck]:
                 args.insert(2, n)
                 n = 1
         elif m is nn.BatchNorm2d:
